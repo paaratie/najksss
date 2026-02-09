@@ -28,7 +28,7 @@ BOT_TOKEN = "8427718534:AAGEejZgg1SsaPSoT5J962bQw3g4KLUWmXY"
 # База данных
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('sessions.db')
+        self.conn = sqlite3.connect('sessions.db', check_same_thread=False)
         self.create_tables()
     
     def create_tables(self):
@@ -47,12 +47,12 @@ class Database:
         ''')
         self.conn.commit()
 
-    def add_session(self, user_id, session_name, session_path, phone):
+    def add_session(self, user_id, session_name, session_path, phone, validated=0):
         cursor = self.conn.cursor()
         cursor.execute('''
-            INSERT INTO sessions (user_id, session_name, session_path, phone, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, session_name, session_path, phone, datetime.now()))
+            INSERT INTO sessions (user_id, session_name, session_path, phone, validated, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, session_name, session_path, phone, validated, datetime.now()))
         self.conn.commit()
         return cursor.lastrowid
 
@@ -119,7 +119,7 @@ class SessionManager:
                             shutil.copy(session_path, perm_path)
                             
                             # Добавляем в БД
-                            db.add_session(user_id, new_filename, perm_path, phone)
+                            db.add_session(user_id, new_filename, perm_path, phone, 1)
                             success_count += 1
                             
                         # Удаляем временный файл
@@ -172,7 +172,7 @@ class SessionManager:
                 shutil.copytree(tdata_path, perm_dir)
                 
                 # Добавляем в БД
-                db.add_session(user_id, f"tdata_session_{len(auth_files)}", perm_dir, "tdata_session")
+                db.add_session(user_id, f"tdata_session_{len(auth_files)}", perm_dir, "tdata_session", 1)
                 return 1
         
         except Exception as e:
@@ -251,6 +251,81 @@ class SessionManager:
 
 session_manager = SessionManager()
 app = Client("session_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# Главное меню
+async def show_main_menu(client: Client, user_id: int, message: Message = None):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Загрузить сессии", callback_data="upload_sessions")],
+        [InlineKeyboardButton("👥 Мои сессии", callback_data="my_sessions")],
+        [InlineKeyboardButton("⚡ Быстрые действия", callback_data="quick_actions")],
+        [InlineKeyboardButton("⚙️ Настройки безопасности", callback_data="security_settings")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")]
+    ])
+    
+    if message:
+        await message.edit_text(
+            "🏠 **Главное меню**\n\n"
+            "Выберите действие:",
+            reply_markup=keyboard
+        )
+    else:
+        await client.send_message(
+            user_id,
+            "🏠 **Главное меню**\n\n"
+            "Выберите действие:",
+            reply_markup=keyboard
+        )
+
+# Обработчик обычных файлов сессий
+async def handle_regular_files(client: Client, message: Message):
+    user_id = message.from_user.id
+    
+    if message.document:
+        file_name = message.document.file_name
+        
+        # Проверяем, является ли файл сессией
+        if any(file_name.endswith(ext) for ext in ['.session', '.json', '.txt']):
+            await message.reply_text(f"📁 Найден файл сессии: `{file_name}`\n\nОбрабатываю...")
+            
+            try:
+                # Скачиваем файл
+                download_path = await client.download_media(message.document.file_id, 
+                                                           file_name=f"temp_{user_id}_{file_name}")
+                
+                # Валидируем сессию
+                is_valid, phone, user_id_tg = await session_manager.validate_session_file(download_path, file_name)
+                
+                if is_valid:
+                    # Сохраняем в постоянное хранилище
+                    perm_dir = f"sessions/user_{user_id}"
+                    os.makedirs(perm_dir, exist_ok=True)
+                    
+                    new_filename = f"{phone}_{file_name}" if phone else file_name
+                    perm_path = os.path.join(perm_dir, new_filename)
+                    
+                    shutil.copy(download_path, perm_path)
+                    
+                    # Добавляем в БД
+                    db.add_session(user_id, new_filename, perm_path, phone, 1)
+                    
+                    await message.reply_text(
+                        f"✅ Сессия успешно добавлена!\n\n"
+                        f"• Файл: `{file_name}`\n"
+                        f"• Номер: `{phone}`\n"
+                        f"• ID: `{user_id_tg}`\n\n"
+                        f"Теперь у вас {len(db.get_user_sessions(user_id))} активных сессий."
+                    )
+                else:
+                    await message.reply_text("❌ Не удалось валидировать сессию. Файл поврежден или неверного формата.")
+                
+                # Удаляем временный файл
+                if os.path.exists(download_path):
+                    os.remove(download_path)
+                    
+            except Exception as e:
+                await message.reply_text(f"❌ Ошибка при обработке файла: {str(e)}")
+        else:
+            await message.reply_text("❌ Формат файла не поддерживается. Отправьте файл с расширением .session, .json или .txt")
 
 # Обработчик ZIP файлов
 @app.on_message()
@@ -349,17 +424,107 @@ async def handle_callback(client: Client, callback_query: CallbackQuery):
                 [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
             ])
         )
+    
+    elif data == "back_to_main":
+        await show_main_menu(client, user_id, callback_query.message)
+    
+    elif data == "my_sessions":
+        sessions = db.get_user_sessions(user_id)
+        if sessions:
+            text = "👥 **Ваши сессии:**\n\n"
+            for i, session in enumerate(sessions, 1):
+                text += f"{i}. `{session[2]}` - {session[4] if session[4] else 'Нет номера'}\n"
+            text += f"\nВсего: {len(sessions)} сессий"
+        else:
+            text = "У вас пока нет добавленных сессий."
+        
+        await callback_query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+            ])
+        )
+    
+    elif data == "quick_actions":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Создать канал", callback_data="action_create_channel")],
+            [InlineKeyboardButton("💬 Создать чат", callback_data="action_create_chat")],
+            [InlineKeyboardButton("✍️ Написать сообщение", callback_data="action_send_message")],
+            [InlineKeyboardButton("👍 Поставить реакцию", callback_data="action_set_reaction")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+        ])
+        
+        await callback_query.message.edit_text(
+            "⚡ **Быстрые действия**\n\n"
+            "Выберите действие для выполнения на всех аккаунтах:",
+            reply_markup=keyboard
+        )
+    
+    elif data == "security_settings":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔐 Сменить 2FA пароль", callback_data="security_change_2fa")],
+            [InlineKeyboardButton("🚫 Выключить 2FA", callback_data="security_disable_2fa")],
+            [InlineKeyboardButton("✅ Включить 2FA", callback_data="security_enable_2fa")],
+            [InlineKeyboardButton("📱 Выбросить все девайсы", callback_data="security_logout_devices")],
+            [InlineKeyboardButton("🔍 Проверить 2FA на всех акках", callback_data="security_check_2fa")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+        ])
+        
+        await callback_query.message.edit_text(
+            "⚙️ **Настройки безопасности**\n\n"
+            "Управление безопасностью аккаунтов:",
+            reply_markup=keyboard
+        )
 
-# Главная функция
+# Обработчик команд
+@app.on_message()
+async def handle_commands(client: Client, message: Message):
+    if message.text == "/start":
+        await show_main_menu(client, message.from_user.id)
+    elif message.text == "/help":
+        await message.reply_text(
+            "📚 **Помощь по боту**\n\n"
+            "Этот бот позволяет управлять множеством сессий Telegram.\n\n"
+            "Основные функции:\n"
+            "• Загрузка сессий (ZIP архивы и отдельные файлы)\n"
+            "• Выполнение действий на всех аккаунтах\n"
+            "• Управление безопасностью аккаунтов\n\n"
+            "Используйте кнопки меню для навигации."
+        )
+
+# Главная функция с исправлением event loop
 async def main():
-    await app.start()
-    print("✅ Бот запущен!")
-    
-    # Создаем директории если нет
-    os.makedirs("sessions", exist_ok=True)
-    
-    await idle()
-    await app.stop()
+    try:
+        # Создаем директории если нет
+        os.makedirs("sessions", exist_ok=True)
+        
+        print("🚀 Запуск бота...")
+        await app.start()
+        print("✅ Бот запущен!")
+        
+        # Получаем информацию о боте
+        me = await app.get_me()
+        print(f"🤖 Бот: @{me.username} ({me.id})")
+        
+        # Ждем сообщений
+        await idle()
+        
+    except KeyboardInterrupt:
+        print("\n⚠️ Получен сигнал прерывания...")
+    except Exception as e:
+        print(f"❌ Ошибка: {e}")
+    finally:
+        print("🛑 Остановка бота...")
+        try:
+            await app.stop()
+            print("✅ Бот остановлен")
+        except Exception as e:
+            print(f"⚠️ Ошибка при остановке: {e}")
 
 if __name__ == "__main__":
+    # Устанавливаем политику event loop для Windows
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    # Запускаем бота
     asyncio.run(main())
