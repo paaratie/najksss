@@ -11,6 +11,7 @@ from pyrogram.types import (
     CallbackQuery, ReplyKeyboardMarkup
 )
 from pyrogram.errors import SessionPasswordNeeded, BadRequest
+from aiohttp import web
 import aiofiles
 import aiofiles.os
 import sqlite3
@@ -21,14 +22,41 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-API_ID = 34185709
-API_HASH = "b5c8271134295cde21ac6373128c0530"
-BOT_TOKEN = "8427718534:AAGEejZgg1SsaPSoT5J962bQw3g4KLUWmXY"
+API_ID = int(os.environ.get("API_ID", "34185709"))
+API_HASH = os.environ.get("API_HASH", "b5c8271134295cde21ac6373128c0530")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8427718534:AAGEejZgg1SsaPSoT5J962bQw3g4KLUWmXY")
+
+# Railway / hosting
+PORT = int(os.environ.get("PORT", "8080"))
+WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
+
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    raise RuntimeError("Missing env vars: API_ID, API_HASH, BOT_TOKEN")
+
+DB_PATH = os.environ.get("DB_PATH", "sessions.db")
 
 # База данных
+# Мини HTTP-сервер для Railway (если сервис запущен как Web Service)
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+
+    async def ok(request):
+        return web.json_response({"status": "ok"})
+
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, WEB_HOST, PORT)
+    await site.start()
+    logger.info(f"🌐 Health server listening on {WEB_HOST}:{PORT}")
+    return runner
+
+
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect('sessions.db', check_same_thread=False)
+        self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.create_tables()
     
     def create_tables(self):
@@ -495,6 +523,8 @@ async def handle_commands(client: Client, message: Message):
 # Главная функция с исправлением event loop
 async def main():
     try:
+        health_runner = None
+        health_runner = await start_health_server()
         # Создаем директории если нет
         os.makedirs("sessions", exist_ok=True)
         
@@ -514,6 +544,11 @@ async def main():
     except Exception as e:
         print(f"❌ Ошибка: {e}")
     finally:
+        if 'health_runner' in locals() and health_runner is not None:
+            try:
+                await health_runner.cleanup()
+            except Exception as e:
+                print(f"⚠️ Ошибка при остановке web-сервера: {e}")
         print("🛑 Остановка бота...")
         try:
             await app.stop()
